@@ -20,5 +20,4 @@ RUN pip install torch-scatter -f https://data.pyg.org/whl/torch-1.12.0+cu117.htm
 # fix some minor version mismatch
 RUN pip uninstall -y  opencv-python
 RUN pip install opencv-python==4.5.5.64
-RUN pip uninstall torchmetrics
 RUN pip install torchmetrics==0.11.4

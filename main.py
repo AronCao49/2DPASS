@@ -42,13 +42,13 @@ def parse_config():
     # general
     parser.add_argument('--gpu', type=int, nargs='+', default=(0,), help='specify gpu devices')
     parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument('--config_path', default='config/2DPASS-semantickitti.yaml')
+    parser.add_argument('--config_path', default='config/SPVCNN-mcdntu.yaml')
     # training
-    parser.add_argument('--log_dir', type=str, default='default', help='log location')
+    parser.add_argument('--log_dir', type=str, default='SPVCNN_mcdntu', help='log location')
     parser.add_argument('--monitor', type=str, default='val/mIoU', help='the maximum metric')
     parser.add_argument('--stop_patience', type=int, default=50, help='patience for stop training')
     parser.add_argument('--save_top_k', type=int, default=1, help='save top k checkpoints, use -1 to checkpoint every epoch')
-    parser.add_argument('--check_val_every_n_epoch', type=int, default=1, help='check_val_every_n_epoch')
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=2, help='check_val_every_n_epoch')
     parser.add_argument('--SWA', action='store_true', default=False, help='StochasticWeightAveraging')
     parser.add_argument('--baseline_only', action='store_true', default=False, help='training without 2D')
     # testing
@@ -142,7 +142,7 @@ if __name__ == '__main__':
     log_folder = 'logs/' + configs['dataset_params']['pc_dataset_type']
     tb_logger = pl_loggers.TensorBoardLogger(log_folder, name=configs.log_dir, default_hp_metric=False)
     os.makedirs(f'{log_folder}/{configs.log_dir}', exist_ok=True)
-    profiler = SimpleProfiler(output_filename=f'{log_folder}/{configs.log_dir}/profiler.txt')
+    profiler = SimpleProfiler(dirpath=f'{log_folder}/{configs.log_dir}', filename='profiler.txt')
     np.set_printoptions(precision=4, suppress=True)
 
     # save the backup files
@@ -192,7 +192,7 @@ if __name__ == '__main__':
         # init trainer
         print('Start training...')
         trainer = pl.Trainer(gpus=[i for i in range(num_gpu)],
-                             accelerator='ddp',
+                             accelerator='cuda',
                              max_epochs=configs['train_params']['max_num_epochs'],
                              resume_from_checkpoint=configs.checkpoint if not configs.fine_tune and not configs.pretrain2d else None,
                              callbacks=[checkpoint_callback,
@@ -214,8 +214,19 @@ if __name__ == '__main__':
         print('Start testing...')
         assert num_gpu == 1, 'only support single GPU testing!'
         trainer = pl.Trainer(gpus=[i for i in range(num_gpu)],
-                             accelerator='ddp',
+                             accelerator='cuda',
                              resume_from_checkpoint=configs.checkpoint,
                              logger=tb_logger,
                              profiler=profiler)
         trainer.test(my_model, test_dataset_loader if configs.submit_to_server else val_dataset_loader)
+        
+        iou_class_finer = [my_model.intersection_finer_list[i].sum / (my_model.union_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        accuracy_class_finer = [my_model.intersection_finer_list[i].sum / (my_model.target_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        mIoU_finer = [np.mean(iou_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        mAcc_finer = [np.mean(accuracy_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        allAcc_finer = [sum(my_model.intersection_finer_list[i].sum) / (sum(my_model.target_finer_list[i].sum) + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        metrics_dist = ['{}'.format(distance) for distance in range(10, 100, 5)]
+        print("-"*80)
+        for ii in range(len(list(range(10, 100, 5)))):
+            print('Val result_{}: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(metrics_dist[ii], mIoU_finer[ii], mAcc_finer[ii], allAcc_finer[ii]))
+        print("-"*80)

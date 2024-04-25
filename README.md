@@ -121,26 +121,27 @@ Please download the Full dataset (v1.0) from the [NuScenes website](https://www.
     ├──lidarseg
 ```
 
+### MCD
+Please follow the official instruction in [MCD website](https://mcdviral.github.io/SemanticSegmentationTutorial.html).
+
 ## Training
-### SemanticKITTI
-You can run the training with
+### MCD-NTU
+Please firstly link the MCD root dir to ```dataset/MCD_NTU```.
+
 ```shell script
-cd <root dir of this repo>
-python main.py --log_dir 2DPASS_semkitti --config config/2DPASS-semantickitti.yaml --gpu 0
-```
-The output will be written to `logs/SemanticKITTI/2DPASS_semkitti` by default. 
-### NuScenes
-```shell script
-cd <root dir of this repo>
-python main.py --log_dir 2DPASS_nusc --config config/2DPASS-nuscenese.yaml --gpu 0 1 2 3
+ln -sfn /path/to/MCD/dataset dataset/MCD_NTU
 ```
 
-### Vanilla Training without 2DPASS
-We take SemanticKITTI as an example.
+You can then run the training with
 ```shell script
 cd <root dir of this repo>
-python main.py --log_dir baseline_semkitti --config config/2DPASS-semantickitti.yaml --gpu 0 --baseline_only
+# for MK-Net
+CUDA_VISIBLE_DEVICES=0 python main.py --log_dir MinkowskiNet_mcdntu --config config/MinkowskiNet-mcdntu.yaml --gpu 0
+# for SPVCNN
+CUDA_VISIBLE_DEVICES=0 python main.py --log_dir SPVCNN_mcdntu --config config/SPVCNN-mcdntu.yaml --gpu 0
 ```
+Kindly note that now we only support SPVCNN and MK-Net.
+
 
 ## Testing
 You can run the testing with

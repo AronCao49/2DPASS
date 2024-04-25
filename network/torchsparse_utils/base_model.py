@@ -13,19 +13,56 @@ import numpy as np
 import pytorch_lightning as pl
 
 from datetime import datetime
-from pytorch_lightning.metrics import Accuracy
+from torchmetrics import Accuracy
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR, CosineAnnealingWarmRestarts, CosineAnnealingLR
 from utils.metric_util import IoU
 from utils.schedulers import cosine_schedule_with_warmup
 
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def intersectionAndUnionGPU(output, target, K, ignore_index=255):
+    # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
+    assert (output.dim() in [1, 2, 3])
+    assert output.shape == target.shape
+    output = output.view(-1)
+    target = target.view(-1)
+    output[target == ignore_index] = ignore_index
+    intersection = output[output == target]
+    area_intersection = torch.histc(intersection, bins=K, min=0, max=K-1)
+    area_output = torch.histc(output, bins=K, min=0, max=K-1)
+    area_target = torch.histc(target, bins=K, min=0, max=K-1)
+    area_union = area_output + area_target - area_intersection
+    return area_intersection, area_union, area_target
 
 class LightningBaseModel(pl.LightningModule):
     def __init__(self, args, criterion):
         super().__init__()
         self.args = args
         self.criterion = criterion
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy(compute_on_step=False)
+        self.train_acc = Accuracy(
+            task='multiclass', 
+            num_classes=args['model_params']['num_class']
+        )
+        self.val_acc = Accuracy(
+            task='multiclass', 
+            num_classes=args['model_params']['num_class'],
+            compute_on_step=False
+        )
         self.val_iou = IoU(self.args['dataset_params'], compute_on_step=False)
 
         if self.args['submit_to_server']:
@@ -34,6 +71,11 @@ class LightningBaseModel(pl.LightningModule):
                 self.mapfile = yaml.safe_load(stream)
 
         self.ignore_label = self.args['dataset_params']['ignore_label']
+        
+        self.ignore_label = self.args['dataset_params']['ignore_label']
+        self.intersection_finer_list = [AverageMeter() for i in range(10, 100, 5)]
+        self.union_finer_list = [AverageMeter() for i in range(10, 100, 5)]
+        self.target_finer_list = [AverageMeter() for i in range(10, 100, 5)]
 
     def configure_optimizers(self):
         if self.args['train_params']['optimizer'] == 'Adam':
@@ -146,20 +188,33 @@ class LightningBaseModel(pl.LightningModule):
             prediction = prediction_mapped.argmax(1).cpu()
             raw_labels = torch.cat(_targets, 0).squeeze(1).cpu()
 
-        if self.ignore_label != 0:
-            prediction = prediction[raw_labels != self.ignore_label]
-            raw_labels = raw_labels[raw_labels != self.ignore_label]
-            prediction += 1
-            raw_labels += 1
+        # if self.ignore_label != 0:
+        #     prediction = prediction[raw_labels != self.ignore_label]
+        #     raw_labels = raw_labels[raw_labels != self.ignore_label]
+        #     prediction += 1
+        #     raw_labels += 1
 
         self.val_acc(prediction, raw_labels)
         self.log('val/acc', self.val_acc, on_epoch=True)
-        self.val_iou(prediction.cpu().detach().numpy(),
+        self.val_iou.update(prediction.cpu().detach().numpy(),
                      raw_labels.cpu().detach().numpy(),
                      )
+        
+        # Distance Evaluation
+        raw_xyz = data_dict['ori_xyz'].F
+        r = torch.linalg.norm(raw_xyz, dim=1)
+        masks_finer = []
+        prediction = prediction.view(-1).cuda().int()
+        raw_labels = raw_labels.view(-1).cuda().int()
+        for r_start in range(10, 100, 5):
+            masks_finer.append((r >= r_start) & (r < r_start + 5))
+        for iii, mask_finer in enumerate(masks_finer):
+            # print(output[mask_finer].shape, target[mask_finer].shape)
+            intersection, union, tgt = intersectionAndUnionGPU(prediction[mask_finer], raw_labels[mask_finer], 24, 255)
+            intersection, union, tgt = intersection.cpu().numpy(), union.cpu().numpy(), tgt.cpu().numpy()
+            self.intersection_finer_list[iii].update(intersection), self.union_finer_list[iii].update(union), self.target_finer_list[iii].update(tgt)
 
         return data_dict['loss']
-
 
     def test_step(self, data_dict, batch_idx):
         path = data_dict['root'][0]
@@ -188,16 +243,16 @@ class LightningBaseModel(pl.LightningModule):
         vote_logits.index_add_(0, indices.cpu(), prediction_mapped.cpu())
         prediction = vote_logits.argmax(1)
 
-        if self.ignore_label != 0:
-            prediction = prediction[raw_labels != self.ignore_label]
-            raw_labels = raw_labels[raw_labels != self.ignore_label]
-            prediction += 1
-            raw_labels += 1
+        # if self.ignore_label != 0:
+        #     prediction = prediction[raw_labels != self.ignore_label]
+        #     raw_labels = raw_labels[raw_labels != self.ignore_label]
+        #     prediction += 1
+        #     raw_labels += 1
 
         if not self.args['submit_to_server']:
             self.val_acc(prediction, raw_labels)
             self.log('val/acc', self.val_acc, on_epoch=True)
-            self.val_iou(prediction.cpu().detach().numpy(),
+            self.val_iou.update(prediction.cpu().detach().numpy(),
                          raw_labels.cpu().detach().numpy(),
                          )
         else:
@@ -246,12 +301,30 @@ class LightningBaseModel(pl.LightningModule):
                 else:
                     original_label.tofile(full_label_name)
 
+        raw_xyz = data_dict['ori_xyz'].squeeze(0)
+        r = torch.linalg.norm(raw_xyz, dim=1)
+        masks_finer = []
+        prediction = prediction.view(-1).cuda().int()
+        raw_labels = raw_labels.view(-1).cuda().int()
+        for r_start in range(10, 100, 5):
+            masks_finer.append((r >= r_start) & (r < r_start + 5))
+        for iii, mask_finer in enumerate(masks_finer):
+            # print(output[mask_finer].shape, target[mask_finer].shape)
+            intersection, union, tgt = intersectionAndUnionGPU(prediction[mask_finer], raw_labels[mask_finer], 24, 255)
+            intersection, union, tgt = intersection.cpu().numpy(), union.cpu().numpy(), tgt.cpu().numpy()
+            self.intersection_finer_list[iii].update(intersection), self.union_finer_list[iii].update(union), self.target_finer_list[iii].update(tgt)
+        
         return data_dict['loss']
 
 
     def validation_epoch_end(self, outputs):
-        iou, best_miou = self.val_iou.compute()
-        mIoU = np.nanmean(iou)
+        if len(self.val_iou.hist_list) != 0:
+            iou, best_miou = self.val_iou.compute()
+            mIoU = np.nanmean(iou)
+        else:
+            iou = np.zeros(len(self.val_iou.unique_label_str))
+            mIoU = 0
+            best_miou = 0
         str_print = ''
         self.log('val/mIoU', mIoU, on_epoch=True)
         self.log('val/best_miou', best_miou, on_epoch=True)
@@ -262,6 +335,18 @@ class LightningBaseModel(pl.LightningModule):
 
         str_print += '\nCurrent val miou is %.3f while the best val miou is %.3f' % (mIoU * 100, best_miou * 100)
         self.print(str_print)
+        
+        # dist eval
+        iou_class_finer = [self.intersection_finer_list[i].sum / (self.union_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        accuracy_class_finer = [self.intersection_finer_list[i].sum / (self.target_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        mIoU_finer = [np.mean(iou_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        mAcc_finer = [np.mean(accuracy_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        allAcc_finer = [sum(self.intersection_finer_list[i].sum) / (sum(self.target_finer_list[i].sum) + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        metrics_dist = ['{}'.format(distance) for distance in range(10, 100, 5)]
+        print("-"*80)
+        for ii in range(len(list(range(10, 100, 5)))):
+            print('Val result_{}: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(metrics_dist[ii], mIoU_finer[ii], mAcc_finer[ii], allAcc_finer[ii]))
+        print("-"*80)
 
 
     def test_epoch_end(self, outputs):
@@ -278,4 +363,16 @@ class LightningBaseModel(pl.LightningModule):
 
             str_print += '\nCurrent val miou is %.3f while the best val miou is %.3f' % (mIoU * 100, best_miou * 100)
             self.print(str_print)
+        
+        # dist eval
+        iou_class_finer = [self.intersection_finer_list[i].sum / (self.union_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        accuracy_class_finer = [self.intersection_finer_list[i].sum / (self.target_finer_list[i].sum + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        mIoU_finer = [np.mean(iou_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        mAcc_finer = [np.mean(accuracy_class_finer[i]) for i in range(len(list(range(10, 100, 5))))]
+        allAcc_finer = [sum(self.intersection_finer_list[i].sum) / (sum(self.target_finer_list[i].sum) + 1e-10) for i in range(len(list(range(10, 100, 5))))]
+        metrics_dist = ['{}'.format(distance) for distance in range(10, 100, 5)]
+        print("-"*80)
+        for ii in range(len(list(range(10, 100, 5)))):
+            print('Val result_{}: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(metrics_dist[ii], mIoU_finer[ii], mAcc_finer[ii], allAcc_finer[ii]))
+        print("-"*80)
 

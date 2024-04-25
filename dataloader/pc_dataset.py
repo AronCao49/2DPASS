@@ -131,6 +131,113 @@ class SemanticKITTI(data.Dataset):
 
 
 @register_dataset
+class MCDNTU(data.Dataset):
+    def __init__(self, config, data_path, imageset='train', num_vote=1):
+        with open(config['dataset_params']['label_mapping'], 'r') as stream:
+            semkittiyaml = yaml.safe_load(stream)
+
+        self.config = config
+        self.num_vote = num_vote
+        self.learning_map = semkittiyaml['learning_map']
+        self.imageset = imageset
+
+        if imageset == 'train':
+            split = semkittiyaml['split']['train']
+            if config['train_params'].get('trainval', False):
+                split += semkittiyaml['split']['valid']
+        elif imageset == 'val':
+            split = semkittiyaml['split']['valid']
+        elif imageset == 'test':
+            split = semkittiyaml['split']['test']
+        else:
+            raise Exception('Split must be train/val/test')
+
+        self.im_idx = []
+        self.proj_matrix = {}
+
+        for i_folder in split:
+            self.im_idx += absoluteFilePaths('/'.join([data_path, str(i_folder), 'inL_bin']), num_vote)
+            calib_path = "./dataloader/calib_mcdntu.txt"
+            calib = self.read_calib(calib_path)
+            proj_matrix = np.matmul(calib["Ps"], calib["Tr"])
+            self.proj_matrix[i_folder] = proj_matrix
+
+        seg_num_per_class = config['dataset_params']['seg_labelweights']
+        if seg_num_per_class is not None:
+            seg_labelweights = seg_num_per_class / np.sum(seg_num_per_class)
+            self.seg_labelweights = np.power(np.amax(seg_labelweights) / seg_labelweights, 1 / 3.0)
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.im_idx)
+
+    @staticmethod
+    def read_calib(calib_path):
+        """
+        :param calib_path: Path to a calibration text file.
+        :return: dict with calibration matrices.
+        """
+        calib_all = {}
+        with open(calib_path, 'r') as f:
+            for line in f.readlines():
+                if line == '\n':
+                    break
+                key, value = line.split(':', 1)
+                calib_all[key] = np.array([float(x) for x in value.split()])
+
+        # reshape matrices
+        calib_out = {}
+        calib_out['Ps'] = calib_all['Ps'].reshape(3, 4)  # 3x4 projection matrix for left camera
+        
+        calib_out['Tr_c2w'] = np.identity(4)  # 4x4 matrix
+        calib_out['Tr_c2w'][:3, :4] = calib_all['T_CM'].reshape(3, 4)
+        calib_out['Tr_w2c'] = np.linalg.inv(calib_out['Tr_c2w'])
+        
+        calib_out['Tr_l2w'] = np.identity(4)  # 4x4 matrix
+        calib_out['Tr_l2w'][:3, :4] = calib_all['T_LV'].reshape(3, 4)
+        
+        calib_out['Tr'] = calib_out['Tr_w2c'] @ calib_out['Tr_l2w']
+
+        return calib_out
+
+    def __getitem__(self, index):
+        raw_data = np.fromfile(self.im_idx[index], dtype=np.float32).reshape((-1, 4))
+        origin_len = len(raw_data)
+        points = raw_data[:, :3]
+
+        if self.imageset == 'test':
+            annotated_data = np.expand_dims(np.zeros_like(raw_data[:, 0], dtype=int), axis=1)
+            instance_label = np.expand_dims(np.zeros_like(raw_data[:, 0], dtype=int), axis=1)
+        else:
+            annotated_data = np.fromfile(self.im_idx[index].replace('inL_bin', 'label')[:-3] + 'label',
+                                         dtype=np.uint32).reshape((-1, 1))
+            instance_label = np.expand_dims(np.zeros_like(raw_data[:, 0], dtype=int), axis=1)
+            # annotated_data = annotated_data & 0xFFFF  # delete high 16 digits binary
+            annotated_data = np.vectorize(self.learning_map.__getitem__)(annotated_data)
+            # annotated_data[annotated_data == 21] = 255
+
+        frame_id = self.im_idx[index][-8:-4]
+        image_file = self.im_idx[index].replace('inL_bin', 'image').replace('.bin', '.png').replace(frame_id, "00" + frame_id)
+        try:
+            image = Image.open(image_file)
+        except:
+            image = None
+        seq = self.im_idx[index].split('/')[-3]
+        proj_matrix = self.proj_matrix[seq]
+
+        data_dict = {}
+        data_dict['xyz'] = points
+        data_dict['labels'] = annotated_data.astype(np.uint8)
+        data_dict['instance_label'] = instance_label
+        data_dict['signal'] = raw_data[:, 3:4]
+        data_dict['origin_len'] = origin_len
+        data_dict['img'] = image
+        data_dict['proj_matrix'] = proj_matrix
+
+        return data_dict, self.im_idx[index]
+
+
+@register_dataset
 class nuScenes(data.Dataset):
     def __init__(self, config, data_path, imageset='train', num_vote=1):
         if config.debug:
@@ -295,3 +402,96 @@ def get_SemKITTI_label_name(label_mapping):
         SemKITTI_label_name[semkittiyaml['learning_map'][i]] = semkittiyaml['labels'][i]
 
     return SemKITTI_label_name
+
+
+if __name__ == "__main__":
+    from tqdm import tqdm
+    import matplotlib.pyplot as plt
+    config = {
+        "dataset_params":{
+            "label_mapping": "/data1/haozhi/code/2DPASS/config/label_mapping/mcd-ntu.yaml",
+            'seg_labelweights': None
+        },
+        'train_params': {}
+    }
+    dataset = MCDNTU(
+        config, 
+        '/data1/haozhi/code/2DPASS/dataset/MCD_NTU',
+        'train')
+    
+    # Count class-wise point number
+    # points_per_class = np.zeros(24, int)
+    # for sample in tqdm(dataset):
+    #     labels = sample[0]['labels']
+    #     points_per_class += np.bincount(labels[labels != 255], minlength=24)
+    
+    # print("Point num per class: ")
+    # for i in range(points_per_class.shape[0]):
+    #     print("- {}".format(points_per_class[i]))
+    
+    def select_points_in_frustum(points_2d, x1, y1, x2, y2):
+        """
+        Select points in a 2D frustum parametrized by x1, y1, x2, y2 in image coordinates
+        :param points_2d: point cloud projected into 2D
+        :param points_3d: point cloud
+        :param x1: left bound
+        :param y1: upper bound
+        :param x2: right bound
+        :param y2: lower bound
+        :return: points (2D and 3D) that are in the frustum
+        """
+        keep_ind = (points_2d[:, 0] > x1) * \
+                   (points_2d[:, 1] > y1) * \
+                   (points_2d[:, 0] < x2) * \
+                   (points_2d[:, 1] < y2)
+
+        return keep_ind
+    
+    def depth_color(val, min_d=0, max_d=120):
+        """ 
+        print Color(HSV's H value) corresponding to distance(m) 
+        close distance = red , far distance = blue
+        """
+        np.clip(val, 0, max_d, out=val) # max distance is 120m but usually not usual
+        return (((val - min_d) / (max_d - min_d)) * 120).astype(np.uint8) 
+    
+    def draw_points_image_depth(img, img_indices, depth, show=True, point_size=0.5, save=None):
+        # depth = normalize_depth(depth, d_min=3., d_max=50.)
+        # depth = normalize_depth(depth, d_min=depth.min(), d_max=depth.max())
+        # colors = []
+        # for depth_val in depth.tolist():
+        #     colors.append(interpolate_or_clip(colormap=turbo_colormap_data, x=depth_val))
+        colors = depth_color(depth).tolist()
+        fig, ax = plt.subplots(figsize=(img.shape[1]/100, img.shape[0]/100))
+        # ax5.imshow(np.full_like(img, 255))
+        ax.imshow(img)
+        ax.scatter(img_indices[:, 1], img_indices[:, 0], c=colors, alpha=0.7, s=point_size)
+
+        ax.axis('off')
+
+        if show:
+            plt.show()
+            
+        if save is not None:
+            plt.savefig(save)
+            plt.close()
+    
+    for sample, _ in dataset:
+        img = sample['img']
+        xyz = sample['xyz']
+        proj_matrix = sample['proj_matrix']
+        labels = sample['labels']
+        # project points into image
+        keep_idx = xyz[:, 0] > 0  # only keep point in front of the vehicle
+        points_hcoords = np.concatenate([xyz[keep_idx], np.ones([keep_idx.sum(), 1], dtype=np.float32)], axis=1)
+        img_points = (proj_matrix @ points_hcoords.T).T
+        img_points = img_points[:, :2] / np.expand_dims(img_points[:, 2], axis=1)  # scale 2D points
+        keep_idx_img_pts = select_points_in_frustum(img_points, 0, 0, *img.size)
+        keep_idx[keep_idx] = keep_idx_img_pts
+        
+        depth = np.linalg.norm(xyz, axis=1)
+        img = np.array(img)
+        draw_points_image_depth(img, img_points, depth, save="./mcdntu_point2img.png")
+        
+        input("Press Enter to continue...")
+        
